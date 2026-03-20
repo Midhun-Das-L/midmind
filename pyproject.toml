@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "midmind"
+version = "0.0.1"
+authors = [
+  { name="Midhun", email="midhun.das.l.25@gmail.com" }
+]
+description = "Prompt engineering toolkit for AI developers"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Utilities"
+]
+
+keywords = ["AI", "prompt", "prompt engineering", "LLM", "toolkit"]
+
+[project.urls]
+Homepage = "https://github.com/Midhun-Das-L/midmind"
