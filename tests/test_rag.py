@@ -95,3 +95,18 @@ def test_autoragx_returns_prompt_or_llm_answer(tmp_path):
     prompt = autoragx(str(tmp_path), "What is AI intelligence?")
     assert "[1] (ai.txt)" in prompt
     assert autoragx(str(tmp_path), "intelligence", llm=lambda p: "ANSWER") == "ANSWER"
+
+
+def test_markdown_headings_are_their_own_chunk_boundary():
+    chunks = chunk_text("# Title\nFirst line\ncontinues here.\n## Next\nMore.", 200, 0)
+    assert chunks == ["# Title First line continues here.", "## Next More."]
+
+
+def test_example_rag_runs():
+    import subprocess, sys, os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ, PYTHONPATH=root)
+    result = subprocess.run([sys.executable, os.path.join(root, "examples", "rag_example.py")],
+                            capture_output=True, text=True, cwd=root, env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "[2] (billing.md)" in result.stdout or "[1] (billing.md)" in result.stdout

@@ -1,17 +1,26 @@
 """
 RAGPromptBuilder: turn a folder of documents into grounded, cited LLM prompts.
 
-Pure standard library: documents are split into overlapping chunks, ranked
-against the question with BM25, and the best chunks are formatted into a
-prompt template that works with any LLM (OpenAI, Claude, Ollama, ...).
+Documents are split into overlapping chunks, ranked against the question, and
+the best chunks are formatted into a prompt template that works with any LLM
+(OpenAI, Claude, Ollama, ...).
+
+Ranking is BM25 keyword search (standard library only) by default. Pass an
+``embedder`` for semantic search, or combine both with ``retriever="hybrid"``.
 """
 
+import json
 import math
 import os
 import re
 from collections import Counter
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Union
+
+from .embeddings import Embedder, Vector, cosine_scores, embed_documents, embed_query, normalize
+
+RETRIEVERS = ("bm25", "embedding", "hybrid")
+RRF_K = 60  # reciprocal-rank-fusion constant (Cormack et al., 2009)
 
 DEFAULT_EXTENSIONS = (".txt", ".md", ".rst", ".csv", ".json", ".html", ".py")
 
@@ -23,6 +32,7 @@ _STOPWORDS = frozenset(
 
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\n\s*\n")
+_HEADING_RE = re.compile(r"^(#{1,6}\s.*)$", re.MULTILINE)
 
 
 def tokenize(text: str) -> List[str]:
@@ -62,7 +72,8 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]
     if overlap < 0 or overlap >= chunk_size:
         raise ValueError("overlap must be >= 0 and smaller than chunk_size")
 
-    sentences = [s.strip() for s in _SENTENCE_RE.split(text) if s and s.strip()]
+    text = _HEADING_RE.sub(r"\n\1\n", text)  # Markdown headings stand alone
+    sentences = [" ".join(s.split()) for s in _SENTENCE_RE.split(text) if s and s.strip()]
     # Hard-split any sentence that is longer than a whole chunk.
     pieces: List[str] = []
     for s in sentences:
@@ -78,7 +89,11 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50) -> List[str]
     current: List[str] = []
     length = 0
     for piece in pieces:
-        if current and length + len(piece) + 1 > chunk_size:
+        if current and _HEADING_RE.match(piece):
+            # A heading starts a fresh chunk (no overlap across sections).
+            chunks.append(" ".join(current))
+            current, length = [], 0
+        elif current and length + len(piece) + 1 > chunk_size:
             chunks.append(" ".join(current))
             # Carry trailing sentences forward as overlap.
             carried: List[str] = []
@@ -179,28 +194,57 @@ class RAGPromptBuilder:
         prompt = rag.build("What is AI?", top_k=3)
         # or, for chat APIs:
         messages = rag.build_messages("What is AI?")
+
+        # semantic search (pip install "midmind[embeddings]")
+        from midmind import SentenceTransformerEmbedder
+        rag = RAGPromptBuilder.from_folder("docs/", embedder=SentenceTransformerEmbedder())
+
+    ``retriever`` is ``"bm25"`` (keywords), ``"embedding"`` (meaning) or
+    ``"hybrid"`` (both, merged with reciprocal rank fusion). It defaults to
+    ``"hybrid"`` when an embedder is given and ``"bm25"`` otherwise.
+    ``min_similarity`` drops embedding matches below that cosine similarity.
     """
 
-    def __init__(self, chunks: Optional[Iterable[Chunk]] = None):
+    def __init__(self, chunks: Optional[Iterable[Chunk]] = None,
+                 embedder: Optional[Embedder] = None,
+                 retriever: Optional[str] = None,
+                 min_similarity: Optional[float] = None):
         self.chunks: List[Chunk] = list(chunks or [])
+        self.embedder = embedder
+        self.retriever = retriever or ("hybrid" if embedder is not None else "bm25")
+        self._check_retriever(self.retriever)
+        self.min_similarity = min_similarity
         self._index: Optional[BM25Index] = None
+        self._vectors: List[Vector] = []  # normalized, aligned with self.chunks
+
+    def _check_retriever(self, retriever: str) -> None:
+        if retriever not in RETRIEVERS:
+            raise ValueError("retriever must be one of %s, got %r" % (RETRIEVERS, retriever))
+        if retriever != "bm25" and self.embedder is None:
+            raise ValueError("retriever=%r needs an embedder, e.g. "
+                             "RAGPromptBuilder(embedder=SentenceTransformerEmbedder())"
+                             % retriever)
 
     # ---- loading ---------------------------------------------------------
 
     @classmethod
     def from_folder(cls, path: str, chunk_size: int = 500, overlap: int = 50,
                     extensions: Sequence[str] = DEFAULT_EXTENSIONS,
-                    recursive: bool = True) -> "RAGPromptBuilder":
-        """Load every text file under ``path`` (a folder or a single file)."""
-        builder = cls()
+                    recursive: bool = True, **options) -> "RAGPromptBuilder":
+        """
+        Load every text file under ``path`` (a folder or a single file).
+        ``options`` (``embedder``, ``retriever``, ``min_similarity``) go to the constructor.
+        """
+        builder = cls(**options)
         builder.add_folder(path, chunk_size, overlap, extensions, recursive)
         return builder
 
     @classmethod
     def from_texts(cls, texts: Union[Sequence[str], Dict[str, str]],
-                   chunk_size: int = 500, overlap: int = 50) -> "RAGPromptBuilder":
+                   chunk_size: int = 500, overlap: int = 50,
+                   **options) -> "RAGPromptBuilder":
         """Load in-memory strings: a list, or a ``{source_name: text}`` dict."""
-        builder = cls()
+        builder = cls(**options)
         items = texts.items() if isinstance(texts, dict) else (
             ("text_%d" % i, t) for i, t in enumerate(texts))
         for source, text in items:
@@ -241,20 +285,92 @@ class RAGPromptBuilder:
 
     # ---- retrieval -------------------------------------------------------
 
-    def retrieve(self, query: str, top_k: int = 3,
-                 min_score: float = 0.0) -> List[Chunk]:
-        """Return the ``top_k`` most relevant chunks, best first."""
-        if not self.chunks:
-            return []
+    def _bm25_ranking(self, query: str) -> List[tuple]:
         if self._index is None:
             self._index = BM25Index(self.chunks)
-        scored = [
-            Chunk(c.text, c.source, c.index, s)
-            for c, s in zip(self.chunks, self._index.scores(query))
-            if s > min_score
-        ]
-        scored.sort(key=lambda c: c.score, reverse=True)
-        return scored[:top_k]
+        pairs = [(i, s) for i, s in enumerate(self._index.scores(query)) if s > 0]
+        return sorted(pairs, key=lambda p: p[1], reverse=True)
+
+    def embed_chunks(self) -> "RAGPromptBuilder":
+        """Embed any chunks not embedded yet (runs automatically on first search)."""
+        if self.embedder is None:
+            raise ValueError("No embedder configured")
+        todo = self.chunks[len(self._vectors):]
+        if todo:
+            vectors = embed_documents(self.embedder, [c.text for c in todo])
+            self._vectors.extend(normalize(v) for v in vectors)
+        return self
+
+    def _embedding_ranking(self, query: str) -> List[tuple]:
+        self.embed_chunks()
+        sims = cosine_scores(embed_query(self.embedder, query), self._vectors)
+        floor = self.min_similarity
+        pairs = [(i, s) for i, s in enumerate(sims) if floor is None or s >= floor]
+        return sorted(pairs, key=lambda p: p[1], reverse=True)
+
+    def retrieve(self, query: str, top_k: int = 3, min_score: float = 0.0,
+                 retriever: Optional[str] = None) -> List[Chunk]:
+        """
+        Return the ``top_k`` most relevant chunks, best first.
+
+        ``score`` is the BM25 score, the cosine similarity, or the fused
+        reciprocal-rank score, depending on the retriever. ``retriever``
+        overrides the builder's default for this call.
+        """
+        retriever = retriever or self.retriever
+        self._check_retriever(retriever)
+        if not self.chunks:
+            return []
+        if retriever == "bm25":
+            ranking = self._bm25_ranking(query)
+        elif retriever == "embedding":
+            ranking = self._embedding_ranking(query)
+        else:
+            fused: Dict[int, float] = {}
+            for ranked in (self._bm25_ranking(query), self._embedding_ranking(query)):
+                for rank, (i, _) in enumerate(ranked):
+                    fused[i] = fused.get(i, 0.0) + 1.0 / (RRF_K + rank + 1)
+            ranking = sorted(fused.items(), key=lambda p: p[1], reverse=True)
+        results = []
+        for i, score in ranking:
+            if min_score and score < min_score:
+                continue
+            c = self.chunks[i]
+            results.append(Chunk(c.text, c.source, c.index, score))
+            if len(results) == top_k:
+                break
+        return results
+
+    # ---- persistence -----------------------------------------------------
+
+    def save(self, path: str) -> None:
+        """Save chunks (and embeddings, if computed) to a JSON file."""
+        if self.embedder is not None:
+            self.embed_chunks()
+        data = {
+            "version": 1,
+            "embedder": repr(self.embedder) if self.embedder is not None else None,
+            "chunks": [{"text": c.text, "source": c.source, "index": c.index}
+                       for c in self.chunks],
+            "vectors": self._vectors,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+    @classmethod
+    def load(cls, path: str, embedder: Optional[Embedder] = None,
+             **options) -> "RAGPromptBuilder":
+        """
+        Load a saved index. Pass the same ``embedder`` used when saving to
+        reuse the stored embeddings without re-computing them.
+        """
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        chunks = [Chunk(c["text"], c["source"], c["index"]) for c in data["chunks"]]
+        builder = cls(chunks, embedder=embedder, **options)
+        if embedder is not None and len(data.get("vectors", [])) == len(chunks):
+            builder._vectors = data["vectors"]
+        return builder
 
     # ---- prompt building -------------------------------------------------
 
