@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "midmind"
-version = "0.0.1"
+version = "0.1.0"
 authors = [
   { name="Midhun", email="midhun.das.l.25@gmail.com" }
 ]
-description = "Prompt engineering toolkit for AI developers"
+description = "Build grounded, cited RAG prompts from your documents in one line. Zero dependencies."
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
@@ -18,10 +18,18 @@ classifiers = [
     "Operating System :: OS Independent",
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Libraries",
-    "Topic :: Utilities"
+    "Topic :: Utilities",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence"
 ]
 
-keywords = ["AI", "prompt", "prompt engineering", "LLM", "toolkit"]
+keywords = ["AI", "prompt", "prompt engineering", "LLM", "RAG", "retrieval", "BM25", "toolkit"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
 
 [project.urls]
 Homepage = "https://github.com/Midhun-Das-L/midmind"
+Issues = "https://github.com/Midhun-Das-L/midmind/issues"
+
+[tool.setuptools]
+packages = ["midmind"]

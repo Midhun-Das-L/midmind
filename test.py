@@ -1,20 +1,12 @@
-# from midmind import PromptBuilder, PromptTemplates, PromptValidator
+from midmind import RAGPromptBuilder, autoragx
 
-# # Build a prompt
-# pb = PromptBuilder()
-# pb.set_instructions("You are an AI assistant.")
-# pb.set_context("User wants to learn about AI prompt engineering.")
-# pb.set_task(PromptTemplates.reasoning("Explain reinforcement learning step by step."))
+# One line: folder + question -> grounded prompt
+print(autoragx("data", "What is artificial intelligence?"))
 
-# prompt = pb.build()
-# print("Prompt:")
-# print(prompt)
+print("\n" + "=" * 60 + "\n")
 
-# Validate the prompt
-# validation = PromptValidator.validate(prompt)
-# print("\nValidation results:", validation)
-
-
-from midmind import autoragx
-
-print(autoragx("data", "AI"))
+# Full control
+rag = RAGPromptBuilder.from_folder("data", chunk_size=500, overlap=50)
+for chunk in rag.retrieve("human intelligence machines", top_k=3):
+    print(chunk)
+print(rag.build_messages("What is artificial intelligence?", template="qa"))
